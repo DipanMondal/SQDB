@@ -66,3 +66,42 @@ added to global free page list
 future inserts from any table can reuse it
 ```
 
+---
+
+## Binary Value Page Design
+
+A table has
+```
+first_page
+last_page
+item_count
+```
+
+Each data page stores multiple variable-length records
+```
+Data Page
+┌──────────────────────────────┐
+│ Page Header                  │
+├──────────────────────────────┤
+│ Record 1                     │
+│ Record 2                     │
+│ Record 3                     │
+│ ...                          │
+└──────────────────────────────┘
+```
+
+Each record is stored as:
+```
+[payload_length][payload_bytes][payload_length]
+```
+
+Why store length twice?
+
+Because:
+```
+Queue read/delete needs first record
+Stack read/delete needs last record
+```
+The ending length lets us find the last record quickly.
+
+---

@@ -4,6 +4,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
+use serde_json::Value as JsonValue;
+
 use crate::error::SqdbError;
 use crate::language::ast::{DataType, TableType};
 
@@ -18,6 +20,7 @@ const TABLE_DIRECTORY_PAGE_ID: u64 = 1;
 const FIRST_DATA_PAGE_ID: u64 = 2;
 
 const PAGE_KIND_TABLE_DIRECTORY: u8 = 1;
+const PAGE_KIND_DATA: u8 = 2;
 const PAGE_KIND_FREE: u8 = 255;
 
 const HEADER_MAGIC_OFFSET: usize = 0;
@@ -43,6 +46,17 @@ const ENTRY_NAME_OFFSET: usize = 40;
 const ENTRY_NAME_MAX_BYTES: usize = 80;
 
 const FREE_PAGE_NEXT_OFFSET: usize = 8;
+
+const DATA_TABLE_ID_OFFSET: usize = 4;
+const DATA_PREV_PAGE_OFFSET: usize = 8;
+const DATA_NEXT_PAGE_OFFSET: usize = 16;
+const DATA_ITEM_COUNT_OFFSET: usize = 24;
+const DATA_START_OFFSET_OFFSET: usize = 28;
+const DATA_END_OFFSET_OFFSET: usize = 30;
+const DATA_HEADER_SIZE: usize = 64;
+
+const RECORD_LENGTH_SIZE: usize = 4;
+const RECORD_OVERHEAD: usize = RECORD_LENGTH_SIZE * 2;
 
 #[derive(Debug, Clone)]
 pub struct BinaryPageStorage {
@@ -117,11 +131,7 @@ impl BinaryPageStorage {
         let mut table_directory_page = [0u8; PAGE_SIZE];
         table_directory_page[0] = PAGE_KIND_TABLE_DIRECTORY;
 
-        write_page_to_file(
-            &mut file,
-            TABLE_DIRECTORY_PAGE_ID,
-            &table_directory_page,
-        )?;
+        write_page_to_file(&mut file, TABLE_DIRECTORY_PAGE_ID, &table_directory_page)?;
 
         file.sync_all().map_err(|err| {
             SqdbError::IoError(format!(
@@ -271,11 +281,18 @@ impl BinaryDatabaseHandle {
             SqdbError::RuntimeError(format!("Table `{}` does not exist.", table_name))
         })?;
 
-        if table.first_page != 0 || table.last_page != 0 || table.item_count != 0 {
-            return Err(SqdbError::RuntimeError(
-                "This table contains data pages. Data-page freeing will be added in the next binary step."
-                    .to_string(),
-            ));
+        let mut current_page_id = table.first_page;
+
+        while current_page_id != 0 {
+            let page = self.read_page(current_page_id)?;
+
+            validate_data_page_for_table(&page, table.slot_index)?;
+
+            let next_page_id = data_next_page(&page);
+
+            self.free_page(current_page_id)?;
+
+            current_page_id = next_page_id;
         }
 
         self.clear_table_entry(table.slot_index)?;
@@ -346,6 +363,146 @@ impl BinaryDatabaseHandle {
         Ok(table.data_type)
     }
 
+    pub fn insert_raw(&mut self, table_name: &str, raw_value: &str) -> Result<(), SqdbError> {
+        let mut table = self.find_table(table_name)?.ok_or_else(|| {
+            SqdbError::RuntimeError(format!("Table `{}` does not exist.", table_name))
+        })?;
+
+        let payload = encode_raw_value(&table.data_type, raw_value)?;
+
+        let required_record_size = payload.len() + RECORD_OVERHEAD;
+
+        if required_record_size > PAGE_SIZE - DATA_HEADER_SIZE {
+            return Err(SqdbError::RuntimeError(format!(
+                "Value is too large for one page. Maximum payload is {} bytes.",
+                PAGE_SIZE - DATA_HEADER_SIZE - RECORD_OVERHEAD
+            )));
+        }
+
+        let table_id = table_id_from_slot(table.slot_index);
+
+        if table.last_page == 0 {
+            let new_page_id = self.allocate_page()?;
+
+            let mut page = new_data_page(table_id, 0, 0);
+            append_record_to_data_page(&mut page, &payload)?;
+
+            self.write_page(new_page_id, &page)?;
+
+            table.first_page = new_page_id;
+            table.last_page = new_page_id;
+        } else {
+            let mut last_page = self.read_page(table.last_page)?;
+
+            validate_data_page_for_table(&last_page, table.slot_index)?;
+
+            if data_available_space(&last_page) < required_record_size {
+                compact_data_page(&mut last_page)?;
+
+                if data_available_space(&last_page) < required_record_size {
+                    let new_page_id = self.allocate_page()?;
+
+                    set_data_next_page(&mut last_page, new_page_id);
+                    self.write_page(table.last_page, &last_page)?;
+
+                    let mut new_page = new_data_page(table_id, table.last_page, 0);
+                    append_record_to_data_page(&mut new_page, &payload)?;
+
+                    self.write_page(new_page_id, &new_page)?;
+
+                    table.last_page = new_page_id;
+                } else {
+                    append_record_to_data_page(&mut last_page, &payload)?;
+                    self.write_page(table.last_page, &last_page)?;
+                }
+            } else {
+                append_record_to_data_page(&mut last_page, &payload)?;
+                self.write_page(table.last_page, &last_page)?;
+            }
+        }
+
+        table.item_count += 1;
+        self.write_table_entry(&table)?;
+
+        self.file.sync_all().map_err(|err| {
+            SqdbError::IoError(format!(
+                "Could not sync insert into `{}`: {}",
+                table_name, err
+            ))
+        })?;
+
+        Ok(())
+    }
+
+    pub fn read_value(&mut self, table_name: &str) -> Result<String, SqdbError> {
+        let table = self.find_table(table_name)?.ok_or_else(|| {
+            SqdbError::RuntimeError(format!("Table `{}` does not exist.", table_name))
+        })?;
+
+        if table.item_count == 0 {
+            return Ok(format!("{}.None", self.db_name));
+        }
+
+        let page_id = match table.table_type {
+            TableType::Stack => table.last_page,
+            TableType::Queue => table.first_page,
+        };
+
+        if page_id == 0 {
+            return Err(SqdbError::IoError(format!(
+                "Table `{}` is corrupted: item count is non-zero but page pointer is zero.",
+                table_name
+            )));
+        }
+
+        let page = self.read_page(page_id)?;
+
+        validate_data_page_for_table(&page, table.slot_index)?;
+
+        let payload = match table.table_type {
+            TableType::Stack => read_last_record_payload(&page)?,
+            TableType::Queue => {
+                let (payload, _) = read_first_record_payload(&page)?;
+                payload
+            }
+        };
+
+        decode_payload_value(&table.data_type, &payload)
+    }
+
+    pub fn delete_value(&mut self, table_name: &str) -> Result<String, SqdbError> {
+        let mut table = self.find_table(table_name)?.ok_or_else(|| {
+            SqdbError::RuntimeError(format!("Table `{}` does not exist.", table_name))
+        })?;
+
+        if table.item_count == 0 {
+            return Ok(format!("{}.None", self.db_name));
+        }
+
+        let result = match table.table_type {
+            TableType::Stack => self.delete_from_stack(&mut table)?,
+            TableType::Queue => self.delete_from_queue(&mut table)?,
+        };
+
+        table.item_count = table.item_count.saturating_sub(1);
+
+        if table.item_count == 0 {
+            table.first_page = 0;
+            table.last_page = 0;
+        }
+
+        self.write_table_entry(&table)?;
+
+        self.file.sync_all().map_err(|err| {
+            SqdbError::IoError(format!(
+                "Could not sync delete from `{}`: {}",
+                table_name, err
+            ))
+        })?;
+
+        Ok(result)
+    }
+
     pub fn allocate_page(&mut self) -> Result<u64, SqdbError> {
         let mut header = self.read_header()?;
 
@@ -402,6 +559,90 @@ impl BinaryDatabaseHandle {
         self.write_header(header)?;
 
         Ok(())
+    }
+
+    fn delete_from_stack(&mut self, table: &mut TableInfo) -> Result<String, SqdbError> {
+        let page_id = table.last_page;
+
+        if page_id == 0 {
+            return Err(SqdbError::IoError(format!(
+                "Table `{}` is corrupted: stack last page is zero.",
+                table.name
+            )));
+        }
+
+        let mut page = self.read_page(page_id)?;
+
+        validate_data_page_for_table(&page, table.slot_index)?;
+
+        let previous_page_id = data_prev_page(&page);
+
+        let payload = remove_last_record_from_data_page(&mut page)?;
+
+        let result = decode_payload_value(&table.data_type, &payload)?;
+
+        if data_item_count(&page) == 0 {
+            self.free_page(page_id)?;
+
+            if previous_page_id != 0 {
+                let mut previous_page = self.read_page(previous_page_id)?;
+                validate_data_page_for_table(&previous_page, table.slot_index)?;
+                set_data_next_page(&mut previous_page, 0);
+                self.write_page(previous_page_id, &previous_page)?;
+            }
+
+            table.last_page = previous_page_id;
+
+            if table.first_page == page_id {
+                table.first_page = 0;
+            }
+        } else {
+            self.write_page(page_id, &page)?;
+        }
+
+        Ok(result)
+    }
+
+    fn delete_from_queue(&mut self, table: &mut TableInfo) -> Result<String, SqdbError> {
+        let page_id = table.first_page;
+
+        if page_id == 0 {
+            return Err(SqdbError::IoError(format!(
+                "Table `{}` is corrupted: queue first page is zero.",
+                table.name
+            )));
+        }
+
+        let mut page = self.read_page(page_id)?;
+
+        validate_data_page_for_table(&page, table.slot_index)?;
+
+        let next_page_id = data_next_page(&page);
+
+        let payload = remove_first_record_from_data_page(&mut page)?;
+
+        let result = decode_payload_value(&table.data_type, &payload)?;
+
+        if data_item_count(&page) == 0 {
+            self.free_page(page_id)?;
+
+            if next_page_id != 0 {
+                let mut next_page = self.read_page(next_page_id)?;
+                validate_data_page_for_table(&next_page, table.slot_index)?;
+                set_data_prev_page(&mut next_page, 0);
+                self.write_page(next_page_id, &next_page)?;
+            }
+
+            table.first_page = next_page_id;
+
+            if table.last_page == page_id {
+                table.last_page = 0;
+            }
+        } else {
+            self.write_page(page_id, &page)?;
+        }
+
+        Ok(result)
     }
 
     fn read_header(&mut self) -> Result<BinaryHeader, SqdbError> {
@@ -553,9 +794,8 @@ fn read_page_from_file(file: &mut File, page_id: u64) -> Result<[u8; PAGE_SIZE],
             SqdbError::IoError(format!("Could not seek to page {}: {}", page_id, err))
         })?;
 
-    file.read_exact(&mut page).map_err(|err| {
-        SqdbError::IoError(format!("Could not read page {}: {}", page_id, err))
-    })?;
+    file.read_exact(&mut page)
+        .map_err(|err| SqdbError::IoError(format!("Could not read page {}: {}", page_id, err)))?;
 
     Ok(page)
 }
@@ -570,9 +810,8 @@ fn write_page_to_file(
             SqdbError::IoError(format!("Could not seek to page {}: {}", page_id, err))
         })?;
 
-    file.write_all(page).map_err(|err| {
-        SqdbError::IoError(format!("Could not write page {}: {}", page_id, err))
-    })?;
+    file.write_all(page)
+        .map_err(|err| SqdbError::IoError(format!("Could not write page {}: {}", page_id, err)))?;
 
     Ok(())
 }
@@ -611,7 +850,7 @@ fn encode_table_entry(page: &mut [u8; PAGE_SIZE], table: &TableInfo) -> Result<(
     write_u32(
         page,
         entry_offset + ENTRY_TABLE_ID_OFFSET,
-        (table.slot_index + 1) as u32,
+        table_id_from_slot(table.slot_index),
     );
 
     write_u64(
@@ -691,6 +930,439 @@ fn decode_table_entry(page: &[u8; PAGE_SIZE], slot_index: usize) -> Result<Table
         last_page,
         slot_index,
     })
+}
+
+fn table_id_from_slot(slot_index: usize) -> u32 {
+    (slot_index + 1) as u32
+}
+
+fn new_data_page(table_id: u32, previous_page: u64, next_page: u64) -> [u8; PAGE_SIZE] {
+    let mut page = [0u8; PAGE_SIZE];
+
+    page[0] = PAGE_KIND_DATA;
+
+    write_u32(&mut page, DATA_TABLE_ID_OFFSET, table_id);
+    write_u64(&mut page, DATA_PREV_PAGE_OFFSET, previous_page);
+    write_u64(&mut page, DATA_NEXT_PAGE_OFFSET, next_page);
+    write_u32(&mut page, DATA_ITEM_COUNT_OFFSET, 0);
+    write_u16(&mut page, DATA_START_OFFSET_OFFSET, DATA_HEADER_SIZE as u16);
+    write_u16(&mut page, DATA_END_OFFSET_OFFSET, DATA_HEADER_SIZE as u16);
+
+    page
+}
+
+fn validate_data_page_for_table(
+    page: &[u8; PAGE_SIZE],
+    slot_index: usize,
+) -> Result<(), SqdbError> {
+    if page[0] != PAGE_KIND_DATA {
+        return Err(SqdbError::IoError(
+            "Expected data page, but page kind is different.".to_string(),
+        ));
+    }
+
+    let expected_table_id = table_id_from_slot(slot_index);
+    let actual_table_id = read_u32(page, DATA_TABLE_ID_OFFSET);
+
+    if actual_table_id != expected_table_id {
+        return Err(SqdbError::IoError(format!(
+            "Data page belongs to table id {}, expected table id {}.",
+            actual_table_id, expected_table_id
+        )));
+    }
+
+    Ok(())
+}
+
+fn data_prev_page(page: &[u8; PAGE_SIZE]) -> u64 {
+    read_u64(page, DATA_PREV_PAGE_OFFSET)
+}
+
+fn data_next_page(page: &[u8; PAGE_SIZE]) -> u64 {
+    read_u64(page, DATA_NEXT_PAGE_OFFSET)
+}
+
+fn set_data_prev_page(page: &mut [u8; PAGE_SIZE], previous_page: u64) {
+    write_u64(page, DATA_PREV_PAGE_OFFSET, previous_page);
+}
+
+fn set_data_next_page(page: &mut [u8; PAGE_SIZE], next_page: u64) {
+    write_u64(page, DATA_NEXT_PAGE_OFFSET, next_page);
+}
+
+fn data_item_count(page: &[u8; PAGE_SIZE]) -> u32 {
+    read_u32(page, DATA_ITEM_COUNT_OFFSET)
+}
+
+fn set_data_item_count(page: &mut [u8; PAGE_SIZE], count: u32) {
+    write_u32(page, DATA_ITEM_COUNT_OFFSET, count);
+}
+
+fn data_start_offset(page: &[u8; PAGE_SIZE]) -> usize {
+    read_u16(page, DATA_START_OFFSET_OFFSET) as usize
+}
+
+fn data_end_offset(page: &[u8; PAGE_SIZE]) -> usize {
+    read_u16(page, DATA_END_OFFSET_OFFSET) as usize
+}
+
+fn set_data_start_offset(page: &mut [u8; PAGE_SIZE], offset: usize) {
+    write_u16(page, DATA_START_OFFSET_OFFSET, offset as u16);
+}
+
+fn set_data_end_offset(page: &mut [u8; PAGE_SIZE], offset: usize) {
+    write_u16(page, DATA_END_OFFSET_OFFSET, offset as u16);
+}
+
+fn data_available_space(page: &[u8; PAGE_SIZE]) -> usize {
+    PAGE_SIZE - data_end_offset(page)
+}
+
+fn append_record_to_data_page(
+    page: &mut [u8; PAGE_SIZE],
+    payload: &[u8],
+) -> Result<(), SqdbError> {
+    let count = data_item_count(page);
+    let mut end_offset = data_end_offset(page);
+
+    let record_size = payload.len() + RECORD_OVERHEAD;
+
+    if PAGE_SIZE - end_offset < record_size {
+        return Err(SqdbError::RuntimeError(
+            "Not enough space in data page.".to_string(),
+        ));
+    }
+
+    if count == 0 {
+        set_data_start_offset(page, DATA_HEADER_SIZE);
+        end_offset = DATA_HEADER_SIZE;
+    }
+
+    write_u32(page, end_offset, payload.len() as u32);
+
+    let payload_start = end_offset + RECORD_LENGTH_SIZE;
+    let payload_end = payload_start + payload.len();
+
+    page[payload_start..payload_end].copy_from_slice(payload);
+
+    write_u32(page, payload_end, payload.len() as u32);
+
+    let new_end_offset = payload_end + RECORD_LENGTH_SIZE;
+
+    set_data_end_offset(page, new_end_offset);
+    set_data_item_count(page, count + 1);
+
+    Ok(())
+}
+
+fn compact_data_page(page: &mut [u8; PAGE_SIZE]) -> Result<(), SqdbError> {
+    let count = data_item_count(page);
+
+    if count == 0 {
+        set_data_start_offset(page, DATA_HEADER_SIZE);
+        set_data_end_offset(page, DATA_HEADER_SIZE);
+        return Ok(());
+    }
+
+    let start_offset = data_start_offset(page);
+    let end_offset = data_end_offset(page);
+
+    if start_offset < DATA_HEADER_SIZE || end_offset < start_offset || end_offset > PAGE_SIZE {
+        return Err(SqdbError::IoError(
+            "Cannot compact corrupted data page offsets.".to_string(),
+        ));
+    }
+
+    if start_offset == DATA_HEADER_SIZE {
+        return Ok(());
+    }
+
+    let live_len = end_offset - start_offset;
+
+    page.copy_within(start_offset..end_offset, DATA_HEADER_SIZE);
+
+    let new_end_offset = DATA_HEADER_SIZE + live_len;
+
+    for byte in &mut page[new_end_offset..end_offset] {
+        *byte = 0;
+    }
+
+    set_data_start_offset(page, DATA_HEADER_SIZE);
+    set_data_end_offset(page, new_end_offset);
+
+    Ok(())
+}
+
+fn read_first_record_payload(page: &[u8; PAGE_SIZE]) -> Result<(Vec<u8>, usize), SqdbError> {
+    let count = data_item_count(page);
+
+    if count == 0 {
+        return Err(SqdbError::RuntimeError(
+            "Cannot read first record from empty data page.".to_string(),
+        ));
+    }
+
+    let start_offset = data_start_offset(page);
+
+    read_record_at(page, start_offset)
+}
+
+fn read_last_record_payload(page: &[u8; PAGE_SIZE]) -> Result<Vec<u8>, SqdbError> {
+    let count = data_item_count(page);
+
+    if count == 0 {
+        return Err(SqdbError::RuntimeError(
+            "Cannot read last record from empty data page.".to_string(),
+        ));
+    }
+
+    let end_offset = data_end_offset(page);
+
+    if end_offset < DATA_HEADER_SIZE + RECORD_OVERHEAD {
+        return Err(SqdbError::IoError(
+            "Corrupted data page: invalid end offset.".to_string(),
+        ));
+    }
+
+    let length_offset = end_offset - RECORD_LENGTH_SIZE;
+    let payload_len = read_u32(page, length_offset) as usize;
+
+    let record_start = end_offset
+        .checked_sub(RECORD_LENGTH_SIZE + payload_len + RECORD_LENGTH_SIZE)
+        .ok_or_else(|| {
+            SqdbError::IoError("Corrupted data page: invalid last record length.".to_string())
+        })?;
+
+    let (payload, record_end) = read_record_at(page, record_start)?;
+
+    if record_end != end_offset {
+        return Err(SqdbError::IoError(
+            "Corrupted data page: last record boundary mismatch.".to_string(),
+        ));
+    }
+
+    Ok(payload)
+}
+
+fn read_record_at(page: &[u8; PAGE_SIZE], offset: usize) -> Result<(Vec<u8>, usize), SqdbError> {
+    if offset + RECORD_LENGTH_SIZE > PAGE_SIZE {
+        return Err(SqdbError::IoError(
+            "Corrupted data page: record offset is out of bounds.".to_string(),
+        ));
+    }
+
+    let payload_len = read_u32(page, offset) as usize;
+
+    let payload_start = offset + RECORD_LENGTH_SIZE;
+    let payload_end = payload_start + payload_len;
+    let trailing_len_offset = payload_end;
+
+    if trailing_len_offset + RECORD_LENGTH_SIZE > PAGE_SIZE {
+        return Err(SqdbError::IoError(
+            "Corrupted data page: record length is out of bounds.".to_string(),
+        ));
+    }
+
+    let trailing_len = read_u32(page, trailing_len_offset) as usize;
+
+    if trailing_len != payload_len {
+        return Err(SqdbError::IoError(
+            "Corrupted data page: record length markers do not match.".to_string(),
+        ));
+    }
+
+    let next_offset = trailing_len_offset + RECORD_LENGTH_SIZE;
+
+    Ok((page[payload_start..payload_end].to_vec(), next_offset))
+}
+
+fn remove_last_record_from_data_page(page: &mut [u8; PAGE_SIZE]) -> Result<Vec<u8>, SqdbError> {
+    let count = data_item_count(page);
+
+    if count == 0 {
+        return Err(SqdbError::RuntimeError(
+            "Cannot remove last record from empty data page.".to_string(),
+        ));
+    }
+
+    let end_offset = data_end_offset(page);
+    let length_offset = end_offset - RECORD_LENGTH_SIZE;
+    let payload_len = read_u32(page, length_offset) as usize;
+
+    let record_start = end_offset
+        .checked_sub(RECORD_LENGTH_SIZE + payload_len + RECORD_LENGTH_SIZE)
+        .ok_or_else(|| {
+            SqdbError::IoError("Corrupted data page: invalid last record length.".to_string())
+        })?;
+
+    let (payload, record_end) = read_record_at(page, record_start)?;
+
+    if record_end != end_offset {
+        return Err(SqdbError::IoError(
+            "Corrupted data page: last record boundary mismatch.".to_string(),
+        ));
+    }
+
+    for byte in &mut page[record_start..end_offset] {
+        *byte = 0;
+    }
+
+    let new_count = count - 1;
+
+    set_data_item_count(page, new_count);
+
+    if new_count == 0 {
+        set_data_start_offset(page, DATA_HEADER_SIZE);
+        set_data_end_offset(page, DATA_HEADER_SIZE);
+    } else {
+        set_data_end_offset(page, record_start);
+    }
+
+    Ok(payload)
+}
+
+fn remove_first_record_from_data_page(page: &mut [u8; PAGE_SIZE]) -> Result<Vec<u8>, SqdbError> {
+    let count = data_item_count(page);
+
+    if count == 0 {
+        return Err(SqdbError::RuntimeError(
+            "Cannot remove first record from empty data page.".to_string(),
+        ));
+    }
+
+    let start_offset = data_start_offset(page);
+    let (payload, next_offset) = read_record_at(page, start_offset)?;
+
+    for byte in &mut page[start_offset..next_offset] {
+        *byte = 0;
+    }
+
+    let new_count = count - 1;
+
+    set_data_item_count(page, new_count);
+
+    if new_count == 0 {
+        set_data_start_offset(page, DATA_HEADER_SIZE);
+        set_data_end_offset(page, DATA_HEADER_SIZE);
+    } else {
+        set_data_start_offset(page, next_offset);
+    }
+
+    Ok(payload)
+}
+
+fn encode_raw_value(data_type: &DataType, raw_value: &str) -> Result<Vec<u8>, SqdbError> {
+    match data_type {
+        DataType::Int => {
+            let value = raw_value.trim().parse::<i64>().map_err(|_| {
+                SqdbError::RuntimeError(format!("Expected int value, found `{}`.", raw_value))
+            })?;
+
+            Ok(value.to_le_bytes().to_vec())
+        }
+
+        DataType::Real => {
+            let value = raw_value.trim().parse::<f64>().map_err(|_| {
+                SqdbError::RuntimeError(format!("Expected real value, found `{}`.", raw_value))
+            })?;
+
+            Ok(value.to_le_bytes().to_vec())
+        }
+
+        DataType::String => {
+            let value = parse_string_value(raw_value)?;
+
+            Ok(value.into_bytes())
+        }
+
+        DataType::Json => {
+            let value = serde_json::from_str::<JsonValue>(raw_value.trim()).map_err(|err| {
+                SqdbError::RuntimeError(format!(
+                    "Expected valid json value, found `{}`. JSON error: {}",
+                    raw_value, err
+                ))
+            })?;
+
+            serde_json::to_vec(&value).map_err(|err| {
+                SqdbError::RuntimeError(format!("Could not encode json value: {}", err))
+            })
+        }
+    }
+}
+
+fn decode_payload_value(data_type: &DataType, payload: &[u8]) -> Result<String, SqdbError> {
+    match data_type {
+        DataType::Int => {
+            if payload.len() != 8 {
+                return Err(SqdbError::IoError(
+                    "Corrupted int payload: expected 8 bytes.".to_string(),
+                ));
+            }
+
+            let value = i64::from_le_bytes(payload.try_into().unwrap());
+
+            Ok(value.to_string())
+        }
+
+        DataType::Real => {
+            if payload.len() != 8 {
+                return Err(SqdbError::IoError(
+                    "Corrupted real payload: expected 8 bytes.".to_string(),
+                ));
+            }
+
+            let value = f64::from_le_bytes(payload.try_into().unwrap());
+
+            Ok(value.to_string())
+        }
+
+        DataType::String => {
+            let value = String::from_utf8(payload.to_vec()).map_err(|err| {
+                SqdbError::IoError(format!("Corrupted string payload: {}", err))
+            })?;
+
+            Ok(value)
+        }
+
+        DataType::Json => {
+            let value = serde_json::from_slice::<JsonValue>(payload).map_err(|err| {
+                SqdbError::IoError(format!("Corrupted json payload: {}", err))
+            })?;
+
+            Ok(value.to_string())
+        }
+    }
+}
+
+fn parse_string_value(raw_value: &str) -> Result<String, SqdbError> {
+    let value = raw_value.trim();
+
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+
+    let starts_with_quote = value.starts_with('"');
+    let ends_with_quote = value.ends_with('"');
+
+    if starts_with_quote || ends_with_quote {
+        if !(starts_with_quote && ends_with_quote) {
+            return Err(SqdbError::RuntimeError(format!(
+                "Invalid string literal `{}`. Quoted strings must start and end with double quotes.",
+                raw_value
+            )));
+        }
+
+        let parsed = serde_json::from_str::<String>(value).map_err(|err| {
+            SqdbError::RuntimeError(format!(
+                "Invalid string literal `{}`. String error: {}",
+                raw_value, err
+            ))
+        })?;
+
+        Ok(parsed)
+    } else {
+        Ok(value.to_string())
+    }
 }
 
 fn table_type_to_u8(table_type: &TableType) -> u8 {
@@ -919,6 +1591,225 @@ mod tests {
         let reused_page = db.allocate_page().unwrap();
 
         assert_eq!(reused_page, page_1);
+
+        drop(db);
+
+        storage.drop_database(db_name).unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn binary_stack_reads_and_deletes_last_inserted_value() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        let storage = BinaryPageStorage::with_base_dir(dir.clone());
+        let db_name = "binary_stack_ops";
+
+        storage.create_database(db_name).unwrap();
+
+        let mut db = storage.open_database(db_name).unwrap();
+
+        db.create_table("numbers", TableType::Stack, DataType::Int)
+            .unwrap();
+
+        db.insert_raw("numbers", "10").unwrap();
+        db.insert_raw("numbers", "20").unwrap();
+        db.insert_raw("numbers", "30").unwrap();
+
+        assert_eq!(db.read_value("numbers").unwrap(), "30");
+        assert_eq!(db.delete_value("numbers").unwrap(), "30");
+        assert_eq!(db.read_value("numbers").unwrap(), "20");
+
+        drop(db);
+
+        storage.drop_database(db_name).unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn binary_queue_reads_and_deletes_first_inserted_value() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        let storage = BinaryPageStorage::with_base_dir(dir.clone());
+        let db_name = "binary_queue_ops";
+
+        storage.create_database(db_name).unwrap();
+
+        let mut db = storage.open_database(db_name).unwrap();
+
+        db.create_table("names", TableType::Queue, DataType::String)
+            .unwrap();
+
+        db.insert_raw("names", "Sourav").unwrap();
+        db.insert_raw("names", "Rahul").unwrap();
+        db.insert_raw("names", "Amit").unwrap();
+
+        assert_eq!(db.read_value("names").unwrap(), "Sourav");
+        assert_eq!(db.delete_value("names").unwrap(), "Sourav");
+        assert_eq!(db.read_value("names").unwrap(), "Rahul");
+
+        drop(db);
+
+        storage.drop_database(db_name).unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn binary_storage_persists_values_after_reopen() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        let storage = BinaryPageStorage::with_base_dir(dir.clone());
+        let db_name = "binary_persistence";
+
+        storage.create_database(db_name).unwrap();
+
+        {
+            let mut db = storage.open_database(db_name).unwrap();
+
+            db.create_table("numbers", TableType::Stack, DataType::Int)
+                .unwrap();
+
+            db.insert_raw("numbers", "100").unwrap();
+            db.insert_raw("numbers", "200").unwrap();
+        }
+
+        {
+            let mut db = storage.open_database(db_name).unwrap();
+
+            assert_eq!(db.read_value("numbers").unwrap(), "200");
+        }
+
+        storage.drop_database(db_name).unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn binary_storage_supports_json_values() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        let storage = BinaryPageStorage::with_base_dir(dir.clone());
+        let db_name = "binary_json";
+
+        storage.create_database(db_name).unwrap();
+
+        let mut db = storage.open_database(db_name).unwrap();
+
+        db.create_table("users", TableType::Queue, DataType::Json)
+            .unwrap();
+
+        db.insert_raw("users", r#"{"name":"Sourav"}"#).unwrap();
+
+        assert_eq!(db.read_value("users").unwrap(), r#"{"name":"Sourav"}"#);
+
+        let invalid = db.insert_raw("users", "{name:Sourav}");
+
+        assert!(invalid.is_err());
+
+        drop(db);
+
+        storage.drop_database(db_name).unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn binary_storage_returns_none_for_empty_table() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        let storage = BinaryPageStorage::with_base_dir(dir.clone());
+        let db_name = "binary_empty_none";
+
+        storage.create_database(db_name).unwrap();
+
+        let mut db = storage.open_database(db_name).unwrap();
+
+        db.create_table("numbers", TableType::Stack, DataType::Int)
+            .unwrap();
+
+        assert_eq!(
+            db.read_value("numbers").unwrap(),
+            "binary_empty_none.None"
+        );
+
+        assert_eq!(
+            db.delete_value("numbers").unwrap(),
+            "binary_empty_none.None"
+        );
+
+        drop(db);
+
+        storage.drop_database(db_name).unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn binary_storage_uses_multiple_pages_for_many_values() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        let storage = BinaryPageStorage::with_base_dir(dir.clone());
+        let db_name = "binary_many_values";
+
+        storage.create_database(db_name).unwrap();
+
+        let mut db = storage.open_database(db_name).unwrap();
+
+        db.create_table("numbers", TableType::Stack, DataType::Int)
+            .unwrap();
+
+        for value in 0..400 {
+            db.insert_raw("numbers", &value.to_string()).unwrap();
+        }
+
+        assert_eq!(db.read_value("numbers").unwrap(), "399");
+
+        let output = db.show_tables().unwrap();
+
+        assert!(output.contains("numbers"));
+        assert!(output.contains("400"));
+        assert!(output.contains("2.."));
+
+        drop(db);
+
+        storage.drop_database(db_name).unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn binary_drop_table_frees_data_pages_for_reuse() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        let storage = BinaryPageStorage::with_base_dir(dir.clone());
+        let db_name = "binary_drop_frees_pages";
+
+        storage.create_database(db_name).unwrap();
+
+        let mut db = storage.open_database(db_name).unwrap();
+
+        db.create_table("numbers", TableType::Stack, DataType::Int)
+            .unwrap();
+
+        for value in 0..400 {
+            db.insert_raw("numbers", &value.to_string()).unwrap();
+        }
+
+        db.drop_table("numbers").unwrap();
+
+        let reused_page = db.allocate_page().unwrap();
+
+        assert!(reused_page >= 2);
 
         drop(db);
 
