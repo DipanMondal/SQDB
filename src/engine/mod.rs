@@ -88,6 +88,8 @@ impl Engine {
                 "A database is already open. Drop it first or restart SQDB.".to_string(),
             ));
         }
+		
+		storage::recover_if_needed(&name)?;
 
         if storage::database_exists(&name) {
             let database = storage::load_database(&name)?;
@@ -121,7 +123,7 @@ impl Engine {
             )));
         }
 
-        storage::delete_database_file(&name)?;
+        storage::delete_database_file_with_journal(&name)?;
 
         self.working_db = None;
         self.committed_db = None;
