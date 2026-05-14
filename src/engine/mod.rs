@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 use crate::error::SqdbError;
 use crate::language::ast::{Command, DataType, TableType};
@@ -32,7 +33,7 @@ pub enum Value {
     Int(i64),
     Real(f64),
     String(String),
-    Json(String),
+    Json(JsonValue),
 }
 
 impl Engine {
@@ -88,8 +89,8 @@ impl Engine {
                 "A database is already open. Drop it first or restart SQDB.".to_string(),
             ));
         }
-		
-		storage::recover_if_needed(&name)?;
+
+        storage::recover_if_needed(&name)?;
 
         if storage::database_exists(&name) {
             let database = storage::load_database(&name)?;
@@ -321,7 +322,7 @@ impl Engine {
 fn parse_value(data_type: &DataType, raw_value: &str) -> Result<Value, SqdbError> {
     match data_type {
         DataType::Int => {
-            let value = raw_value.parse::<i64>().map_err(|_| {
+            let value = raw_value.trim().parse::<i64>().map_err(|_| {
                 SqdbError::RuntimeError(format!("Expected int value, found `{}`.", raw_value))
             })?;
 
@@ -329,7 +330,7 @@ fn parse_value(data_type: &DataType, raw_value: &str) -> Result<Value, SqdbError
         }
 
         DataType::Real => {
-            let value = raw_value.parse::<f64>().map_err(|_| {
+            let value = raw_value.trim().parse::<f64>().map_err(|_| {
                 SqdbError::RuntimeError(format!("Expected real value, found `{}`.", raw_value))
             })?;
 
@@ -337,43 +338,53 @@ fn parse_value(data_type: &DataType, raw_value: &str) -> Result<Value, SqdbError
         }
 
         DataType::String => {
-            let value = strip_optional_quotes(raw_value);
+            let value = parse_string_value(raw_value)?;
 
             Ok(Value::String(value))
         }
 
         DataType::Json => {
-            let value = raw_value.trim();
+            let value = serde_json::from_str::<JsonValue>(raw_value.trim()).map_err(|err| {
+                SqdbError::RuntimeError(format!(
+                    "Expected valid json value, found `{}`. JSON error: {}",
+                    raw_value, err
+                ))
+            })?;
 
-            if is_simple_json(value) {
-                Ok(Value::Json(value.to_string()))
-            } else {
-                Err(SqdbError::RuntimeError(format!(
-                    "Expected json value, found `{}`.",
-                    raw_value
-                )))
-            }
+            Ok(Value::Json(value))
         }
     }
 }
 
-fn strip_optional_quotes(value: &str) -> String {
-    let value = value.trim();
+fn parse_string_value(raw_value: &str) -> Result<String, SqdbError> {
+    let value = raw_value.trim();
 
-    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
-        value[1..value.len() - 1].to_string()
-    } else {
-        value.to_string()
+    if value.is_empty() {
+        return Ok(String::new());
     }
-}
 
-fn is_simple_json(value: &str) -> bool {
-    let value = value.trim();
+    let starts_with_quote = value.starts_with('"');
+    let ends_with_quote = value.ends_with('"');
 
-    let is_object = value.starts_with('{') && value.ends_with('}');
-    let is_array = value.starts_with('[') && value.ends_with(']');
+    if starts_with_quote || ends_with_quote {
+        if !(starts_with_quote && ends_with_quote) {
+            return Err(SqdbError::RuntimeError(format!(
+                "Invalid string literal `{}`. Quoted strings must start and end with double quotes.",
+                raw_value
+            )));
+        }
 
-    is_object || is_array
+        let parsed = serde_json::from_str::<String>(value).map_err(|err| {
+            SqdbError::RuntimeError(format!(
+                "Invalid string literal `{}`. String error: {}",
+                raw_value, err
+            ))
+        })?;
+
+        Ok(parsed)
+    } else {
+        Ok(value.to_string())
+    }
 }
 
 impl fmt::Display for TableType {
@@ -440,4 +451,154 @@ Other:
 "#;
 
     text.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+    use crate::language::parser::parse_command;
+
+    fn run(engine: &mut Engine, input: &str) -> String {
+        let command = parse_command(input).expect("Command should parse");
+        engine.execute(command).expect("Command should execute")
+    }
+
+    fn cleanup_database_files(database_name: &str) {
+        let _ = fs::remove_file(format!("{}.sqdb", database_name));
+        let _ = fs::remove_file(format!("{}.sqdb.tmp", database_name));
+        let _ = fs::remove_file(format!("{}.sqdb.journal", database_name));
+    }
+
+    #[test]
+    fn stack_reads_last_inserted_value() {
+        let db_name = "test_stack_reads_last_inserted_value";
+        cleanup_database_files(db_name);
+
+        let mut engine = Engine::new();
+
+        run(&mut engine, &format!("create db {};", db_name));
+        run(&mut engine, "create table numbers stack int;");
+        run(&mut engine, "insert numbers 10;");
+        run(&mut engine, "insert numbers 20;");
+
+        let output = run(&mut engine, "read numbers;");
+
+        assert_eq!(output, "20");
+
+        cleanup_database_files(db_name);
+    }
+
+    #[test]
+    fn queue_reads_first_inserted_value() {
+        let db_name = "test_queue_reads_first_inserted_value";
+        cleanup_database_files(db_name);
+
+        let mut engine = Engine::new();
+
+        run(&mut engine, &format!("create db {};", db_name));
+        run(&mut engine, "create table names queue string;");
+        run(&mut engine, "insert names Sourav;");
+        run(&mut engine, "insert names Rahul;");
+
+        let output = run(&mut engine, "read names;");
+
+        assert_eq!(output, "Sourav");
+
+        cleanup_database_files(db_name);
+    }
+
+    #[test]
+    fn empty_table_returns_global_none_object() {
+        let db_name = "test_empty_table_returns_global_none_object";
+        cleanup_database_files(db_name);
+
+        let mut engine = Engine::new();
+
+        run(&mut engine, &format!("create db {};", db_name));
+        run(&mut engine, "create table empty_stack stack int;");
+
+        let output = run(&mut engine, "read empty_stack;");
+
+        assert_eq!(output, format!("{}.None", db_name));
+
+        cleanup_database_files(db_name);
+    }
+
+    #[test]
+    fn rollback_restores_last_committed_state() {
+        let db_name = "test_rollback_restores_last_committed_state";
+        cleanup_database_files(db_name);
+
+        let mut engine = Engine::new();
+
+        run(&mut engine, &format!("create db {};", db_name));
+        run(&mut engine, "create table numbers stack int;");
+        run(&mut engine, "insert numbers 100;");
+        run(&mut engine, "commit;");
+        run(&mut engine, "insert numbers 200;");
+
+        assert_eq!(run(&mut engine, "read numbers;"), "200");
+
+        run(&mut engine, "rollback;");
+
+        assert_eq!(run(&mut engine, "read numbers;"), "100");
+
+        cleanup_database_files(db_name);
+    }
+
+    #[test]
+    fn json_accepts_valid_json() {
+        let db_name = "test_json_accepts_valid_json";
+        cleanup_database_files(db_name);
+
+        let mut engine = Engine::new();
+
+        run(&mut engine, &format!("create db {};", db_name));
+        run(&mut engine, "create table users queue json;");
+        run(&mut engine, r#"insert users {"name":"Sourav"};"#);
+
+        let output = run(&mut engine, "read users;");
+
+        assert_eq!(output, r#"{"name":"Sourav"}"#);
+
+        cleanup_database_files(db_name);
+    }
+
+    #[test]
+    fn json_rejects_invalid_json() {
+        let db_name = "test_json_rejects_invalid_json";
+        cleanup_database_files(db_name);
+
+        let mut engine = Engine::new();
+
+        run(&mut engine, &format!("create db {};", db_name));
+        run(&mut engine, "create table users queue json;");
+
+        let command = parse_command("insert users {name:Sourav};").unwrap();
+        let result = engine.execute(command);
+
+        assert!(result.is_err());
+
+        cleanup_database_files(db_name);
+    }
+
+    #[test]
+    fn quoted_string_supports_spaces() {
+        let db_name = "test_quoted_string_supports_spaces";
+        cleanup_database_files(db_name);
+
+        let mut engine = Engine::new();
+
+        run(&mut engine, &format!("create db {};", db_name));
+        run(&mut engine, "create table messages queue string;");
+        run(&mut engine, r#"insert messages "hello world";"#);
+
+        let output = run(&mut engine, "read messages;");
+
+        assert_eq!(output, "hello world");
+
+        cleanup_database_files(db_name);
+    }
 }
