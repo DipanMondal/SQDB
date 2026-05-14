@@ -1,6 +1,7 @@
-<h1 align="center">SQ DB</h1>
+# SQ DB
 ---
-# Project Structure
+
+## Project Structure
 ```
 sqdb/
 ├── Cargo.toml
