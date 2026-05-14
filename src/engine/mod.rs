@@ -1,39 +1,14 @@
-use std::collections::{HashMap, VecDeque};
-use std::fmt;
-
-use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::error::SqdbError;
 use crate::language::ast::{Command, DataType, TableType};
+use crate::model::{Database, Table, Value};
 use crate::storage;
 
 #[derive(Debug, Clone)]
 pub struct Engine {
     working_db: Option<Database>,
     committed_db: Option<Database>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Database {
-    pub name: String,
-    pub tables: HashMap<String, Table>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Table {
-    pub name: String,
-    pub table_type: TableType,
-    pub data_type: DataType,
-    pub data: VecDeque<Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Value {
-    Int(i64),
-    Real(f64),
-    String(String),
-    Json(JsonValue),
 }
 
 impl Engine {
@@ -101,10 +76,7 @@ impl Engine {
             return Ok(format!("Database `{}` loaded from file.", name));
         }
 
-        let database = Database {
-            name: name.clone(),
-            tables: HashMap::new(),
-        };
+        let database = Database::new(name.clone());
 
         storage::save_database_atomic(&database)?;
 
@@ -147,12 +119,7 @@ impl Engine {
             )));
         }
 
-        let table = Table {
-            name: name.clone(),
-            table_type,
-            data_type,
-            data: VecDeque::new(),
-        };
+        let table = Table::new(name.clone(), table_type, data_type);
 
         db.tables.insert(name.clone(), table);
 
@@ -195,7 +162,7 @@ impl Engine {
                 table.name,
                 table.table_type,
                 table.data_type,
-                table.data.len()
+                table.len()
             ));
         }
 
@@ -384,37 +351,6 @@ fn parse_string_value(raw_value: &str) -> Result<String, SqdbError> {
         Ok(parsed)
     } else {
         Ok(value.to_string())
-    }
-}
-
-impl fmt::Display for TableType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TableType::Stack => write!(f, "stack"),
-            TableType::Queue => write!(f, "queue"),
-        }
-    }
-}
-
-impl fmt::Display for DataType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DataType::Int => write!(f, "int"),
-            DataType::Real => write!(f, "real"),
-            DataType::String => write!(f, "string"),
-            DataType::Json => write!(f, "json"),
-        }
-    }
-}
-
-impl fmt::Display for Value {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Value::Int(value) => write!(f, "{}", value),
-            Value::Real(value) => write!(f, "{}", value),
-            Value::String(value) => write!(f, "{}", value),
-            Value::Json(value) => write!(f, "{}", value),
-        }
     }
 }
 

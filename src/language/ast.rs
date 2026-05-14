@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::SqdbError;
@@ -21,6 +23,15 @@ impl TableType {
     }
 }
 
+impl fmt::Display for TableType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TableType::Stack => write!(f, "stack"),
+            TableType::Queue => write!(f, "queue"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataType {
     Int,
@@ -40,6 +51,17 @@ impl DataType {
                 "Invalid data type `{}`. Expected `int`, `real`, `string`, or `json`.",
                 value
             ))),
+        }
+    }
+}
+
+impl fmt::Display for DataType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DataType::Int => write!(f, "int"),
+            DataType::Real => write!(f, "real"),
+            DataType::String => write!(f, "string"),
+            DataType::Json => write!(f, "json"),
         }
     }
 }

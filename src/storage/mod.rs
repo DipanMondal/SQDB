@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::Database;
+use crate::model::Database;
 use crate::error::SqdbError;
 
 const SQDB_EXTENSION: &str = "sqdb";
