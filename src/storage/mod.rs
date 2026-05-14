@@ -1,3 +1,5 @@
+pub mod binary;
+
 use std::fs;
 use std::fs::File;
 use std::io::Write;
