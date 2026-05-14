@@ -9,15 +9,20 @@ impl Engine {
     }
 
     pub fn execute(&mut self, command: Command) -> Result<String, SqdbError> {
-        match command {
-            Command::Help => Ok(help_text()),
+		match command {
+			Command::Help => Ok(help_text()),
 
-            other => Ok(format!(
-                "Command parsed successfully: {:?}\nEngine execution will be added in the next step.",
-                other
-            )),
-        }
-    }
+			Command::ShowTables => Ok(
+				"Show tables command parsed successfully.\nActual table listing will be added when we build the in-memory engine."
+					.to_string(),
+			),
+
+			other => Ok(format!(
+				"Command parsed successfully: {:?}\nEngine execution will be added in the next step.",
+				other
+			)),
+		}
+	}
 }
 
 fn help_text() -> String {
@@ -32,6 +37,7 @@ Table:
   create table <table_name> <stack|queue> <int|real|string|json>;
   drop <table_name>;
   drop table <table_name>;
+  show tables;
 
 Info:
   type <table_name>;

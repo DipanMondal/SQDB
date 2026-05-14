@@ -12,23 +12,24 @@ pub fn parse_command(input: &str) -> Result<Command, SqdbError> {
         .ok_or_else(|| SqdbError::ParseError("Could not read command.".to_string()))?;
 
     match first_word.to_lowercase().as_str() {
-        "create" => parse_create(rest),
-        "drop" => parse_drop(rest),
-        "type" => parse_type(rest),
-        "dtype" => parse_dtype(rest),
-        "insert" => parse_insert(rest),
-        "read" => parse_read(rest),
-        "delete" => parse_delete(rest),
-        "commit" => parse_no_arg_command(rest, Command::Commit),
-        "rollback" => parse_no_arg_command(rest, Command::Rollback),
-        "help" => parse_no_arg_command(rest, Command::Help),
-        "exit" => parse_no_arg_command(rest, Command::Exit),
-        "quit" => parse_no_arg_command(rest, Command::Exit),
-        other => Err(SqdbError::ParseError(format!(
-            "Unknown command `{}`.",
-            other
-        ))),
-    }
+		"create" => parse_create(rest),
+		"drop" => parse_drop(rest),
+		"show" => parse_show(rest),
+		"type" => parse_type(rest),
+		"dtype" => parse_dtype(rest),
+		"insert" => parse_insert(rest),
+		"read" => parse_read(rest),
+		"delete" => parse_delete(rest),
+		"commit" => parse_no_arg_command(rest, Command::Commit),
+		"rollback" => parse_no_arg_command(rest, Command::Rollback),
+		"help" => parse_no_arg_command(rest, Command::Help),
+		"exit" => parse_no_arg_command(rest, Command::Exit),
+		"quit" => parse_no_arg_command(rest, Command::Exit),
+		other => Err(SqdbError::ParseError(format!(
+			"Unknown command `{}`.",
+			other
+		))),
+	}
 }
 
 fn parse_create(rest: &str) -> Result<Command, SqdbError> {
@@ -99,6 +100,23 @@ fn parse_drop(rest: &str) -> Result<Command, SqdbError> {
                 name: table_name.to_string(),
             })
         }
+    }
+}
+
+fn parse_show(rest: &str) -> Result<Command, SqdbError> {
+    let (arg, rest) = take_word(rest)
+        .ok_or_else(|| SqdbError::ParseError("Expected `tables` after `show`.".to_string()))?;
+
+    match arg.to_lowercase().as_str() {
+        "tables" => {
+            ensure_no_extra_text(rest)?;
+            Ok(Command::ShowTables)
+        }
+
+        other => Err(SqdbError::ParseError(format!(
+            "Expected `tables` after `show`, found `{}`.",
+            other
+        ))),
     }
 }
 

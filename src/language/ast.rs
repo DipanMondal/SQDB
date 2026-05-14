@@ -61,6 +61,8 @@ pub enum Command {
     DropTable {
         name: String,
     },
+	
+	ShowTables,
 
     Type {
         table_name: String,
