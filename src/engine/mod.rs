@@ -1,8 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::SqdbError;
 use crate::language::ast::{Command, DataType, TableType};
+use crate::storage;
 
 #[derive(Debug, Clone)]
 pub struct Engine {
@@ -10,22 +13,22 @@ pub struct Engine {
     committed_db: Option<Database>,
 }
 
-#[derive(Debug, Clone)]
-struct Database {
-    name: String,
-    tables: HashMap<String, Table>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Database {
+    pub name: String,
+    pub tables: HashMap<String, Table>,
 }
 
-#[derive(Debug, Clone)]
-struct Table {
-    name: String,
-    table_type: TableType,
-    data_type: DataType,
-    data: VecDeque<Value>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Table {
+    pub name: String,
+    pub table_type: TableType,
+    pub data_type: DataType,
+    pub data: VecDeque<Value>,
 }
 
-#[derive(Debug, Clone)]
-enum Value {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Value {
     Int(i64),
     Real(f64),
     String(String),
@@ -86,13 +89,24 @@ impl Engine {
             ));
         }
 
-        let db = Database {
+        if storage::database_exists(&name) {
+            let database = storage::load_database(&name)?;
+
+            self.working_db = Some(database.clone());
+            self.committed_db = Some(database);
+
+            return Ok(format!("Database `{}` loaded from file.", name));
+        }
+
+        let database = Database {
             name: name.clone(),
             tables: HashMap::new(),
         };
 
-        self.working_db = Some(db.clone());
-        self.committed_db = Some(db);
+        storage::save_database_atomic(&database)?;
+
+        self.working_db = Some(database.clone());
+        self.committed_db = Some(database);
 
         Ok(format!("Database `{}` created.", name))
     }
@@ -106,6 +120,8 @@ impl Engine {
                 name, db.name
             )));
         }
+
+        storage::delete_database_file(&name)?;
 
         self.working_db = None;
         self.committed_db = None;
@@ -244,15 +260,13 @@ impl Engine {
     }
 
     fn commit(&mut self) -> Result<String, SqdbError> {
-        if self.working_db.is_none() {
-            return Err(SqdbError::RuntimeError(
-                "No database is currently open.".to_string(),
-            ));
-        }
+        let database = self.get_db()?.clone();
 
-        self.committed_db = self.working_db.clone();
+        storage::save_database_atomic(&database)?;
 
-        Ok("Transaction committed.".to_string())
+        self.committed_db = Some(database);
+
+        Ok("Transaction committed and saved to disk.".to_string())
     }
 
     fn rollback(&mut self) -> Result<String, SqdbError> {

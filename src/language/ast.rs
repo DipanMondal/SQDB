@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
+
 use crate::error::SqdbError;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TableType {
     Stack,
     Queue,
@@ -19,7 +21,7 @@ impl TableType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataType {
     Int,
     Real,
@@ -61,8 +63,8 @@ pub enum Command {
     DropTable {
         name: String,
     },
-	
-	ShowTables,
+
+    ShowTables,
 
     Type {
         table_name: String,
