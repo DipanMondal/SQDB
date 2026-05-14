@@ -3,12 +3,12 @@ use serde_json::Value as JsonValue;
 use crate::error::SqdbError;
 use crate::language::ast::{Command, DataType, TableType};
 use crate::model::{Database, Table, Value};
-use crate::storage;
+use crate::storage::{JsonFileStorage, StorageManager};
 
-#[derive(Debug, Clone)]
 pub struct Engine {
     working_db: Option<Database>,
     committed_db: Option<Database>,
+    storage: Box<dyn StorageManager>,
 }
 
 impl Engine {
@@ -16,6 +16,15 @@ impl Engine {
         Self {
             working_db: None,
             committed_db: None,
+            storage: Box::new(JsonFileStorage::new()),
+        }
+    }
+
+    pub fn with_storage(storage: Box<dyn StorageManager>) -> Self {
+        Self {
+            working_db: None,
+            committed_db: None,
+            storage,
         }
     }
 
@@ -65,10 +74,10 @@ impl Engine {
             ));
         }
 
-        storage::recover_if_needed(&name)?;
+        self.storage.recover_if_needed(&name)?;
 
-        if storage::database_exists(&name) {
-            let database = storage::load_database(&name)?;
+        if self.storage.database_exists(&name) {
+            let database = self.storage.load_database(&name)?;
 
             self.working_db = Some(database.clone());
             self.committed_db = Some(database);
@@ -78,7 +87,7 @@ impl Engine {
 
         let database = Database::new(name.clone());
 
-        storage::save_database_atomic(&database)?;
+        self.storage.save_database(&database)?;
 
         self.working_db = Some(database.clone());
         self.committed_db = Some(database);
@@ -96,7 +105,7 @@ impl Engine {
             )));
         }
 
-        storage::delete_database_file_with_journal(&name)?;
+        self.storage.delete_database(&name)?;
 
         self.working_db = None;
         self.committed_db = None;
@@ -232,7 +241,7 @@ impl Engine {
     fn commit(&mut self) -> Result<String, SqdbError> {
         let database = self.get_db()?.clone();
 
-        storage::save_database_atomic(&database)?;
+        self.storage.save_database(&database)?;
 
         self.committed_db = Some(database);
 
