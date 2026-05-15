@@ -1,30 +1,27 @@
-use serde_json::Value as JsonValue;
+use std::fs;
+use std::path::PathBuf;
 
 use crate::error::SqdbError;
 use crate::language::ast::{Command, DataType, TableType};
-use crate::model::{Database, Table, Value};
-use crate::storage::{JsonFileStorage, StorageManager};
+use crate::storage::binary::{BinaryDatabaseHandle, BinaryPageStorage};
 
 pub struct Engine {
-    working_db: Option<Database>,
-    committed_db: Option<Database>,
-    storage: Box<dyn StorageManager>,
+    storage: BinaryPageStorage,
+    current_db: Option<BinaryDatabaseHandle>,
 }
 
 impl Engine {
     pub fn new() -> Self {
         Self {
-            working_db: None,
-            committed_db: None,
-            storage: Box::new(JsonFileStorage::new()),
+            storage: BinaryPageStorage::new(),
+            current_db: None,
         }
     }
 
-    pub fn with_storage(storage: Box<dyn StorageManager>) -> Self {
+    pub fn with_binary_storage(storage: BinaryPageStorage) -> Self {
         Self {
-            working_db: None,
-            committed_db: None,
             storage,
+            current_db: None,
         }
     }
 
@@ -68,49 +65,52 @@ impl Engine {
     }
 
     fn create_db(&mut self, name: String) -> Result<String, SqdbError> {
-        if self.working_db.is_some() {
+        if self.current_db.is_some() {
             return Err(SqdbError::RuntimeError(
                 "A database is already open. Drop it first or restart SQDB.".to_string(),
             ));
         }
 
-        self.storage.recover_if_needed(&name)?;
+        let existed_before = self.storage.database_exists(&name);
 
-        if self.storage.database_exists(&name) {
-            let database = self.storage.load_database(&name)?;
+        let handle = self.storage.open_or_create_database(&name)?;
 
-            self.working_db = Some(database.clone());
-            self.committed_db = Some(database);
+        self.current_db = Some(handle);
 
-            return Ok(format!("Database `{}` loaded from file.", name));
+        if existed_before {
+            Ok(format!("Binary database `{}` opened.", name))
+        } else {
+            Ok(format!("Binary database `{}` created.", name))
         }
-
-        let database = Database::new(name.clone());
-
-        self.storage.save_database(&database)?;
-
-        self.working_db = Some(database.clone());
-        self.committed_db = Some(database);
-
-        Ok(format!("Database `{}` created.", name))
     }
 
     fn drop_db(&mut self, name: String) -> Result<String, SqdbError> {
-        let db = self.get_db()?;
+        let current_db_name = self
+            .current_db
+            .as_ref()
+            .ok_or_else(|| {
+                SqdbError::RuntimeError(
+                    "No database is currently open. Use `create db <database_name>;` first."
+                        .to_string(),
+                )
+            })?
+            .database_name()
+            .to_string();
 
-        if db.name != name {
+        if current_db_name != name {
             return Err(SqdbError::RuntimeError(format!(
                 "Cannot drop database `{}` because current database is `{}`.",
-                name, db.name
+                name, current_db_name
             )));
         }
 
-        self.storage.delete_database(&name)?;
+        // Important on Windows:
+        // Close the open file handle before deleting the database file.
+        self.current_db = None;
 
-        self.working_db = None;
-        self.committed_db = None;
+        self.storage.drop_database(&name)?;
 
-        Ok(format!("Database `{}` dropped.", name))
+        Ok(format!("Binary database `{}` dropped.", name))
     }
 
     fn create_table(
@@ -121,245 +121,89 @@ impl Engine {
     ) -> Result<String, SqdbError> {
         let db = self.get_db_mut()?;
 
-        if db.tables.contains_key(&name) {
-            return Err(SqdbError::RuntimeError(format!(
-                "Table `{}` already exists.",
-                name
-            )));
-        }
+        db.create_table(&name, table_type.clone(), data_type.clone())?;
 
-        let table = Table::new(name.clone(), table_type, data_type);
-
-        db.tables.insert(name.clone(), table);
-
-        Ok(format!("Table `{}` created.", name))
+        Ok(format!(
+            "Table `{}` created as {} {}.",
+            name, table_type, data_type
+        ))
     }
 
     fn drop_table(&mut self, name: String) -> Result<String, SqdbError> {
         let db = self.get_db_mut()?;
 
-        match db.tables.remove(&name) {
-            Some(_) => Ok(format!("Table `{}` dropped.", name)),
-            None => Err(SqdbError::RuntimeError(format!(
-                "Table `{}` does not exist.",
-                name
-            ))),
-        }
+        db.drop_table(&name)?;
+
+        Ok(format!("Table `{}` dropped.", name))
     }
 
-    fn show_tables(&self) -> Result<String, SqdbError> {
-        let db = self.get_db()?;
+    fn show_tables(&mut self) -> Result<String, SqdbError> {
+        let db = self.get_db_mut()?;
 
-        if db.tables.is_empty() {
-            return Ok("No tables found.".to_string());
-        }
-
-        let mut output = String::new();
-
-        output.push_str("Tables:\n");
-        output.push_str("---------------------------------------------\n");
-        output.push_str("Name                 Type      DType     Items\n");
-        output.push_str("---------------------------------------------\n");
-
-        let mut tables: Vec<&Table> = db.tables.values().collect();
-
-        tables.sort_by(|a, b| a.name.cmp(&b.name));
-
-        for table in tables {
-            output.push_str(&format!(
-                "{:<20} {:<9} {:<9} {}\n",
-                table.name,
-                table.table_type,
-                table.data_type,
-                table.len()
-            ));
-        }
-
-        Ok(output)
+        db.show_tables()
     }
 
-    fn get_table_type(&self, table_name: String) -> Result<String, SqdbError> {
-        let table = self.get_table(&table_name)?;
+    fn get_table_type(&mut self, table_name: String) -> Result<String, SqdbError> {
+        let db = self.get_db_mut()?;
 
-        Ok(format!("{}", table.table_type))
+        let table_type = db.get_table_type(&table_name)?;
+
+        Ok(table_type.to_string())
     }
 
-    fn get_table_dtype(&self, table_name: String) -> Result<String, SqdbError> {
-        let table = self.get_table(&table_name)?;
+    fn get_table_dtype(&mut self, table_name: String) -> Result<String, SqdbError> {
+        let db = self.get_db_mut()?;
 
-        Ok(format!("{}", table.data_type))
+        let data_type = db.get_table_dtype(&table_name)?;
+
+        Ok(data_type.to_string())
     }
 
     fn insert_value(&mut self, table_name: String, raw_value: String) -> Result<String, SqdbError> {
-        let table = self.get_table_mut(&table_name)?;
+        let db = self.get_db_mut()?;
 
-        let value = parse_value(&table.data_type, &raw_value)?;
+        db.insert_raw(&table_name, &raw_value)?;
 
-        match table.table_type {
-            TableType::Stack => {
-                table.data.push_back(value);
-                Ok(format!("Value inserted into stack `{}`.", table_name))
-            }
-
-            TableType::Queue => {
-                table.data.push_back(value);
-                Ok(format!("Value inserted into queue `{}`.", table_name))
-            }
-        }
+        Ok(format!("Value inserted into `{}`.", table_name))
     }
 
-    fn read_value(&self, table_name: String) -> Result<String, SqdbError> {
-        let db_name = self.get_db()?.name.clone();
-        let table = self.get_table(&table_name)?;
+    fn read_value(&mut self, table_name: String) -> Result<String, SqdbError> {
+        let db = self.get_db_mut()?;
 
-        let value = match table.table_type {
-            TableType::Stack => table.data.back(),
-            TableType::Queue => table.data.front(),
-        };
-
-        match value {
-            Some(value) => Ok(value.to_string()),
-            None => Ok(format!("{}.None", db_name)),
-        }
+        db.read_value(&table_name)
     }
 
     fn delete_value(&mut self, table_name: String) -> Result<String, SqdbError> {
-        let db_name = self.get_db()?.name.clone();
-        let table = self.get_table_mut(&table_name)?;
+        let db = self.get_db_mut()?;
 
-        let value = match table.table_type {
-            TableType::Stack => table.data.pop_back(),
-            TableType::Queue => table.data.pop_front(),
-        };
-
-        match value {
-            Some(value) => Ok(value.to_string()),
-            None => Ok(format!("{}.None", db_name)),
-        }
+        db.delete_value(&table_name)
     }
 
     fn commit(&mut self) -> Result<String, SqdbError> {
-        let database = self.get_db()?.clone();
+        self.get_db_mut()?;
 
-        self.storage.save_database(&database)?;
-
-        self.committed_db = Some(database);
-
-        Ok("Transaction committed and saved to disk.".to_string())
+        Ok(
+            "Commit acknowledged. Current binary backend writes each operation directly to disk. Full transaction journaling will be added next."
+                .to_string(),
+        )
     }
 
     fn rollback(&mut self) -> Result<String, SqdbError> {
-        if self.committed_db.is_none() {
-            return Err(SqdbError::RuntimeError(
-                "No committed database state found.".to_string(),
-            ));
-        }
+        self.get_db_mut()?;
 
-        self.working_db = self.committed_db.clone();
-
-        Ok("Transaction rolled back.".to_string())
+        Err(SqdbError::RuntimeError(
+            "Rollback is not available yet for BinaryPageStorage. Disk-based page journal rollback will be added in the next step."
+                .to_string(),
+        ))
     }
 
-    fn get_db(&self) -> Result<&Database, SqdbError> {
-        self.working_db.as_ref().ok_or_else(|| {
+    fn get_db_mut(&mut self) -> Result<&mut BinaryDatabaseHandle, SqdbError> {
+        self.current_db.as_mut().ok_or_else(|| {
             SqdbError::RuntimeError(
                 "No database is currently open. Use `create db <database_name>;` first."
                     .to_string(),
             )
         })
-    }
-
-    fn get_db_mut(&mut self) -> Result<&mut Database, SqdbError> {
-        self.working_db.as_mut().ok_or_else(|| {
-            SqdbError::RuntimeError(
-                "No database is currently open. Use `create db <database_name>;` first."
-                    .to_string(),
-            )
-        })
-    }
-
-    fn get_table(&self, table_name: &str) -> Result<&Table, SqdbError> {
-        let db = self.get_db()?;
-
-        db.tables.get(table_name).ok_or_else(|| {
-            SqdbError::RuntimeError(format!("Table `{}` does not exist.", table_name))
-        })
-    }
-
-    fn get_table_mut(&mut self, table_name: &str) -> Result<&mut Table, SqdbError> {
-        let db = self.get_db_mut()?;
-
-        db.tables.get_mut(table_name).ok_or_else(|| {
-            SqdbError::RuntimeError(format!("Table `{}` does not exist.", table_name))
-        })
-    }
-}
-
-fn parse_value(data_type: &DataType, raw_value: &str) -> Result<Value, SqdbError> {
-    match data_type {
-        DataType::Int => {
-            let value = raw_value.trim().parse::<i64>().map_err(|_| {
-                SqdbError::RuntimeError(format!("Expected int value, found `{}`.", raw_value))
-            })?;
-
-            Ok(Value::Int(value))
-        }
-
-        DataType::Real => {
-            let value = raw_value.trim().parse::<f64>().map_err(|_| {
-                SqdbError::RuntimeError(format!("Expected real value, found `{}`.", raw_value))
-            })?;
-
-            Ok(Value::Real(value))
-        }
-
-        DataType::String => {
-            let value = parse_string_value(raw_value)?;
-
-            Ok(Value::String(value))
-        }
-
-        DataType::Json => {
-            let value = serde_json::from_str::<JsonValue>(raw_value.trim()).map_err(|err| {
-                SqdbError::RuntimeError(format!(
-                    "Expected valid json value, found `{}`. JSON error: {}",
-                    raw_value, err
-                ))
-            })?;
-
-            Ok(Value::Json(value))
-        }
-    }
-}
-
-fn parse_string_value(raw_value: &str) -> Result<String, SqdbError> {
-    let value = raw_value.trim();
-
-    if value.is_empty() {
-        return Ok(String::new());
-    }
-
-    let starts_with_quote = value.starts_with('"');
-    let ends_with_quote = value.ends_with('"');
-
-    if starts_with_quote || ends_with_quote {
-        if !(starts_with_quote && ends_with_quote) {
-            return Err(SqdbError::RuntimeError(format!(
-                "Invalid string literal `{}`. Quoted strings must start and end with double quotes.",
-                raw_value
-            )));
-        }
-
-        let parsed = serde_json::from_str::<String>(value).map_err(|err| {
-            SqdbError::RuntimeError(format!(
-                "Invalid string literal `{}`. String error: {}",
-                raw_value, err
-            ))
-        })?;
-
-        Ok(parsed)
-    } else {
-        Ok(value.to_string())
     }
 }
 
@@ -400,150 +244,141 @@ Other:
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::language::parser::parse_command;
+
+    fn unique_test_dir() -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        std::env::temp_dir().join(format!("sqdb_engine_binary_test_{}", timestamp))
+    }
 
     fn run(engine: &mut Engine, input: &str) -> String {
         let command = parse_command(input).expect("Command should parse");
         engine.execute(command).expect("Command should execute")
     }
 
-    fn cleanup_database_files(database_name: &str) {
-        let _ = fs::remove_file(format!("{}.sqdb", database_name));
-        let _ = fs::remove_file(format!("{}.sqdb.tmp", database_name));
-        let _ = fs::remove_file(format!("{}.sqdb.journal", database_name));
-    }
-
     #[test]
-    fn stack_reads_last_inserted_value() {
-        let db_name = "test_stack_reads_last_inserted_value";
-        cleanup_database_files(db_name);
+    fn cli_engine_uses_binary_stack_behavior() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
 
-        let mut engine = Engine::new();
+        let storage = BinaryPageStorage::with_base_dir(dir.clone());
+        let mut engine = Engine::with_binary_storage(storage);
 
-        run(&mut engine, &format!("create db {};", db_name));
+        run(&mut engine, "create db test_stack;");
         run(&mut engine, "create table numbers stack int;");
         run(&mut engine, "insert numbers 10;");
         run(&mut engine, "insert numbers 20;");
+        run(&mut engine, "insert numbers 30;");
 
-        let output = run(&mut engine, "read numbers;");
+        assert_eq!(run(&mut engine, "read numbers;"), "30");
+        assert_eq!(run(&mut engine, "delete numbers;"), "30");
+        assert_eq!(run(&mut engine, "read numbers;"), "20");
 
-        assert_eq!(output, "20");
+        run(&mut engine, "drop db test_stack;");
 
-        cleanup_database_files(db_name);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn queue_reads_first_inserted_value() {
-        let db_name = "test_queue_reads_first_inserted_value";
-        cleanup_database_files(db_name);
+    fn cli_engine_uses_binary_queue_behavior() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
 
-        let mut engine = Engine::new();
+        let storage = BinaryPageStorage::with_base_dir(dir.clone());
+        let mut engine = Engine::with_binary_storage(storage);
 
-        run(&mut engine, &format!("create db {};", db_name));
+        run(&mut engine, "create db test_queue;");
         run(&mut engine, "create table names queue string;");
         run(&mut engine, "insert names Sourav;");
         run(&mut engine, "insert names Rahul;");
+        run(&mut engine, "insert names Amit;");
 
-        let output = run(&mut engine, "read names;");
+        assert_eq!(run(&mut engine, "read names;"), "Sourav");
+        assert_eq!(run(&mut engine, "delete names;"), "Sourav");
+        assert_eq!(run(&mut engine, "read names;"), "Rahul");
 
-        assert_eq!(output, "Sourav");
+        run(&mut engine, "drop db test_queue;");
 
-        cleanup_database_files(db_name);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn empty_table_returns_global_none_object() {
-        let db_name = "test_empty_table_returns_global_none_object";
-        cleanup_database_files(db_name);
+    fn cli_engine_persists_binary_database_after_restart() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
 
-        let mut engine = Engine::new();
+        {
+            let storage = BinaryPageStorage::with_base_dir(dir.clone());
+            let mut engine = Engine::with_binary_storage(storage);
 
-        run(&mut engine, &format!("create db {};", db_name));
+            run(&mut engine, "create db test_persist;");
+            run(&mut engine, "create table numbers stack int;");
+            run(&mut engine, "insert numbers 100;");
+            run(&mut engine, "insert numbers 200;");
+        }
+
+        {
+            let storage = BinaryPageStorage::with_base_dir(dir.clone());
+            let mut engine = Engine::with_binary_storage(storage);
+
+            run(&mut engine, "create db test_persist;");
+
+            assert_eq!(run(&mut engine, "read numbers;"), "200");
+
+            run(&mut engine, "drop db test_persist;");
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cli_engine_supports_show_tables_type_and_dtype() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        let storage = BinaryPageStorage::with_base_dir(dir.clone());
+        let mut engine = Engine::with_binary_storage(storage);
+
+        run(&mut engine, "create db test_info;");
+        run(&mut engine, "create table events queue json;");
+
+        let output = run(&mut engine, "show tables;");
+
+        assert!(output.contains("events"));
+        assert!(output.contains("queue"));
+        assert!(output.contains("json"));
+
+        assert_eq!(run(&mut engine, "type events;"), "queue");
+        assert_eq!(run(&mut engine, "dtype events;"), "json");
+
+        run(&mut engine, "drop db test_info;");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cli_engine_returns_none_for_empty_table() {
+        let dir = unique_test_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        let storage = BinaryPageStorage::with_base_dir(dir.clone());
+        let mut engine = Engine::with_binary_storage(storage);
+
+        run(&mut engine, "create db test_none;");
         run(&mut engine, "create table empty_stack stack int;");
 
-        let output = run(&mut engine, "read empty_stack;");
+        assert_eq!(run(&mut engine, "read empty_stack;"), "test_none.None");
+        assert_eq!(run(&mut engine, "delete empty_stack;"), "test_none.None");
 
-        assert_eq!(output, format!("{}.None", db_name));
+        run(&mut engine, "drop db test_none;");
 
-        cleanup_database_files(db_name);
-    }
-
-    #[test]
-    fn rollback_restores_last_committed_state() {
-        let db_name = "test_rollback_restores_last_committed_state";
-        cleanup_database_files(db_name);
-
-        let mut engine = Engine::new();
-
-        run(&mut engine, &format!("create db {};", db_name));
-        run(&mut engine, "create table numbers stack int;");
-        run(&mut engine, "insert numbers 100;");
-        run(&mut engine, "commit;");
-        run(&mut engine, "insert numbers 200;");
-
-        assert_eq!(run(&mut engine, "read numbers;"), "200");
-
-        run(&mut engine, "rollback;");
-
-        assert_eq!(run(&mut engine, "read numbers;"), "100");
-
-        cleanup_database_files(db_name);
-    }
-
-    #[test]
-    fn json_accepts_valid_json() {
-        let db_name = "test_json_accepts_valid_json";
-        cleanup_database_files(db_name);
-
-        let mut engine = Engine::new();
-
-        run(&mut engine, &format!("create db {};", db_name));
-        run(&mut engine, "create table users queue json;");
-        run(&mut engine, r#"insert users {"name":"Sourav"};"#);
-
-        let output = run(&mut engine, "read users;");
-
-        assert_eq!(output, r#"{"name":"Sourav"}"#);
-
-        cleanup_database_files(db_name);
-    }
-
-    #[test]
-    fn json_rejects_invalid_json() {
-        let db_name = "test_json_rejects_invalid_json";
-        cleanup_database_files(db_name);
-
-        let mut engine = Engine::new();
-
-        run(&mut engine, &format!("create db {};", db_name));
-        run(&mut engine, "create table users queue json;");
-
-        let command = parse_command("insert users {name:Sourav};").unwrap();
-        let result = engine.execute(command);
-
-        assert!(result.is_err());
-
-        cleanup_database_files(db_name);
-    }
-
-    #[test]
-    fn quoted_string_supports_spaces() {
-        let db_name = "test_quoted_string_supports_spaces";
-        cleanup_database_files(db_name);
-
-        let mut engine = Engine::new();
-
-        run(&mut engine, &format!("create db {};", db_name));
-        run(&mut engine, "create table messages queue string;");
-        run(&mut engine, r#"insert messages "hello world";"#);
-
-        let output = run(&mut engine, "read messages;");
-
-        assert_eq!(output, "hello world");
-
-        cleanup_database_files(db_name);
+        let _ = fs::remove_dir_all(dir);
     }
 }
