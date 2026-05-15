@@ -2,7 +2,7 @@ use std::convert::TryInto;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
 
@@ -58,6 +58,21 @@ const DATA_HEADER_SIZE: usize = 64;
 const RECORD_LENGTH_SIZE: usize = 4;
 const RECORD_OVERHEAD: usize = RECORD_LENGTH_SIZE * 2;
 
+const JOURNAL_MAGIC: &[u8; 8] = b"SQDBJNL1";
+const JOURNAL_VERSION: u32 = 1;
+const JOURNAL_HEADER_SIZE: usize = PAGE_SIZE;
+const JOURNAL_HEADER_SIZE_U64: u64 = JOURNAL_HEADER_SIZE as u64;
+const JOURNAL_ENTRY_SIZE: u64 = 8 + PAGE_SIZE_U64;
+
+const JOURNAL_MAGIC_OFFSET: usize = 0;
+const JOURNAL_VERSION_OFFSET: usize = 8;
+const JOURNAL_PAGE_SIZE_OFFSET: usize = 12;
+const JOURNAL_ENTRY_COUNT_OFFSET: usize = 16;
+const JOURNAL_ORIGINAL_FILE_LEN_OFFSET: usize = 24;
+const JOURNAL_DB_NAME_LEN_OFFSET: usize = 32;
+const JOURNAL_DB_NAME_OFFSET: usize = 64;
+const JOURNAL_DB_NAME_MAX_BYTES: usize = 256;
+
 #[derive(Debug, Clone)]
 pub struct BinaryPageStorage {
     base_dir: PathBuf,
@@ -85,6 +100,13 @@ struct BinaryHeader {
     next_page_id: u64,
     free_page_head: u64,
     table_count: u32,
+}
+
+#[derive(Debug, Clone)]
+struct JournalHeader {
+    entry_count: u64,
+    original_file_len: u64,
+    db_name: String,
 }
 
 impl BinaryPageStorage {
@@ -146,7 +168,9 @@ impl BinaryPageStorage {
 
     pub fn open_database(&self, database_name: &str) -> Result<BinaryDatabaseHandle, SqdbError> {
         validate_database_name(database_name)?;
-
+		
+		self.recover_if_needed(database_name)?;
+		
         let path = self.database_path(database_name);
 
         let mut file = OpenOptions::new()
@@ -191,25 +215,91 @@ impl BinaryPageStorage {
     }
 
     pub fn drop_database(&self, database_name: &str) -> Result<(), SqdbError> {
-        validate_database_name(database_name)?;
+		validate_database_name(database_name)?;
 
-        let path = self.database_path(database_name);
+		let path = self.database_path(database_name);
+		let journal_path = self.journal_path(database_name);
 
-        if path.exists() {
-            fs::remove_file(&path).map_err(|err| {
-                SqdbError::IoError(format!(
-                    "Could not drop binary database `{}`: {}",
-                    path.display(),
-                    err
-                ))
-            })?;
-        }
+		if path.exists() {
+			fs::remove_file(&path).map_err(|err| {
+				SqdbError::IoError(format!(
+					"Could not drop binary database `{}`: {}",
+					path.display(),
+					err
+				))
+			})?;
+		}
 
-        Ok(())
-    }
+		if journal_path.exists() {
+			fs::remove_file(&journal_path).map_err(|err| {
+				SqdbError::IoError(format!(
+					"Could not remove binary journal `{}`: {}",
+					journal_path.display(),
+					err
+				))
+			})?;
+		}
+
+		Ok(())
+	}
 
     fn database_path(&self, database_name: &str) -> PathBuf {
         self.base_dir.join(format!("{}.sqdb", database_name))
+    }
+	
+	fn journal_path(&self, database_name: &str) -> PathBuf {
+		self.base_dir.join(format!("{}.sqdb.journal", database_name))
+	}
+	
+	pub fn recover_if_needed(&self, database_name: &str) -> Result<(), SqdbError> {
+        validate_database_name(database_name)?;
+
+        let journal_path = self.journal_path(database_name);
+
+        if !journal_path.exists() {
+            return Ok(());
+        }
+
+        let database_path = self.database_path(database_name);
+
+        if !database_path.exists() {
+            return Err(SqdbError::IoError(format!(
+                "Journal exists for `{}`, but database file is missing.",
+                database_name
+            )));
+        }
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&database_path)
+            .map_err(|err| {
+                SqdbError::IoError(format!(
+                    "Could not open database `{}` for journal recovery: {}",
+                    database_path.display(),
+                    err
+                ))
+            })?;
+
+        rollback_journal_file(&mut file, &journal_path, database_name)?;
+
+        file.sync_all().map_err(|err| {
+            SqdbError::IoError(format!(
+                "Could not sync recovered database `{}`: {}",
+                database_path.display(),
+                err
+            ))
+        })?;
+
+        fs::remove_file(&journal_path).map_err(|err| {
+            SqdbError::IoError(format!(
+                "Could not remove recovered journal `{}`: {}",
+                journal_path.display(),
+                err
+            ))
+        })?;
+
+        Ok(())
     }
 }
 
@@ -226,6 +316,121 @@ impl BinaryDatabaseHandle {
 
     pub fn database_path(&self) -> &PathBuf {
         &self.path
+    }
+	
+	pub fn commit_transaction(&mut self) -> Result<(), SqdbError> {
+        self.file.sync_all().map_err(|err| {
+            SqdbError::IoError(format!(
+                "Could not sync database `{}` before commit: {}",
+                self.path.display(),
+                err
+            ))
+        })?;
+
+        let journal_path = self.journal_path();
+
+        if journal_path.exists() {
+            fs::remove_file(&journal_path).map_err(|err| {
+                SqdbError::IoError(format!(
+                    "Could not remove journal `{}` during commit: {}",
+                    journal_path.display(),
+                    err
+                ))
+            })?;
+        }
+
+        Ok(())
+    }
+
+    pub fn rollback_transaction(&mut self) -> Result<(), SqdbError> {
+        let journal_path = self.journal_path();
+
+        if !journal_path.exists() {
+            return Ok(());
+        }
+
+        rollback_journal_file(&mut self.file, &journal_path, &self.db_name)?;
+
+        self.file.sync_all().map_err(|err| {
+            SqdbError::IoError(format!(
+                "Could not sync database `{}` after rollback: {}",
+                self.path.display(),
+                err
+            ))
+        })?;
+
+        fs::remove_file(&journal_path).map_err(|err| {
+            SqdbError::IoError(format!(
+                "Could not remove journal `{}` after rollback: {}",
+                journal_path.display(),
+                err
+            ))
+        })?;
+
+        Ok(())
+    }
+
+    fn journal_path(&self) -> PathBuf {
+        self.path
+            .with_file_name(format!("{}.sqdb.journal", self.db_name))
+    }
+
+    fn create_journal_if_needed(&mut self) -> Result<(), SqdbError> {
+        let journal_path = self.journal_path();
+
+        if journal_path.exists() {
+            return Ok(());
+        }
+
+        let original_file_len = self.file.metadata().map_err(|err| {
+            SqdbError::IoError(format!(
+                "Could not read database file metadata for `{}`: {}",
+                self.path.display(),
+                err
+            ))
+        })?.len();
+
+        let header = JournalHeader {
+            entry_count: 0,
+            original_file_len,
+            db_name: self.db_name.clone(),
+        };
+
+        write_new_journal_file(&journal_path, &header)?;
+
+        Ok(())
+    }
+
+    fn journal_page_if_needed(&mut self, page_id: u64) -> Result<(), SqdbError> {
+        self.create_journal_if_needed()?;
+
+        let journal_path = self.journal_path();
+        let journal_header = read_journal_header_from_path(&journal_path)?;
+
+        if journal_header.db_name != self.db_name {
+            return Err(SqdbError::IoError(format!(
+                "Journal database mismatch. Expected `{}`, found `{}`.",
+                self.db_name, journal_header.db_name
+            )));
+        }
+
+        let page_start = page_id * PAGE_SIZE_U64;
+
+        // If this page did not exist when the transaction started,
+        // rollback will remove it by truncating the file.
+        if page_start >= journal_header.original_file_len {
+            return Ok(());
+        }
+
+        if journal_contains_page(&journal_path, page_id)? {
+            return Ok(());
+        }
+
+        let old_page = read_page_from_file(&mut self.file, page_id)?;
+
+        append_journal_entry(&journal_path, page_id, &old_page)?;
+
+        Ok(())
     }
 
     pub fn create_table(
@@ -650,16 +855,18 @@ impl BinaryDatabaseHandle {
     }
 
     fn write_header(&mut self, header: BinaryHeader) -> Result<(), SqdbError> {
-        write_header_to_file(&mut self.file, header)
-    }
+		self.journal_page_if_needed(HEADER_PAGE_ID)?;
+		write_header_to_file(&mut self.file, header)
+	}
 
     fn read_page(&mut self, page_id: u64) -> Result<[u8; PAGE_SIZE], SqdbError> {
         read_page_from_file(&mut self.file, page_id)
     }
 
     fn write_page(&mut self, page_id: u64, page: &[u8; PAGE_SIZE]) -> Result<(), SqdbError> {
-        write_page_to_file(&mut self.file, page_id, page)
-    }
+		self.journal_page_if_needed(page_id)?;
+		write_page_to_file(&mut self.file, page_id, page)
+	}
 
     fn load_tables(&mut self) -> Result<Vec<TableInfo>, SqdbError> {
         let directory_page = self.read_page(TABLE_DIRECTORY_PAGE_ID)?;
@@ -1468,6 +1675,326 @@ fn write_u64(buffer: &mut [u8], offset: usize, value: u64) {
     buffer[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+fn write_new_journal_file(path: &Path, header: &JournalHeader) -> Result<(), SqdbError> {
+    let mut file = File::create(path).map_err(|err| {
+        SqdbError::IoError(format!(
+            "Could not create journal file `{}`: {}",
+            path.display(),
+            err
+        ))
+    })?;
+
+    write_journal_header_to_file(&mut file, header)?;
+
+    file.sync_all().map_err(|err| {
+        SqdbError::IoError(format!(
+            "Could not sync new journal file `{}`: {}",
+            path.display(),
+            err
+        ))
+    })?;
+
+    Ok(())
+}
+
+fn write_journal_header_to_file(
+    file: &mut File,
+    header: &JournalHeader,
+) -> Result<(), SqdbError> {
+    let db_name_bytes = header.db_name.as_bytes();
+
+    if db_name_bytes.len() > JOURNAL_DB_NAME_MAX_BYTES {
+        return Err(SqdbError::RuntimeError(format!(
+            "Database name `{}` is too long for journal.",
+            header.db_name
+        )));
+    }
+
+    let mut page = [0u8; PAGE_SIZE];
+
+    page[JOURNAL_MAGIC_OFFSET..JOURNAL_MAGIC_OFFSET + 8].copy_from_slice(JOURNAL_MAGIC);
+
+    write_u32(&mut page, JOURNAL_VERSION_OFFSET, JOURNAL_VERSION);
+    write_u32(&mut page, JOURNAL_PAGE_SIZE_OFFSET, PAGE_SIZE as u32);
+    write_u64(&mut page, JOURNAL_ENTRY_COUNT_OFFSET, header.entry_count);
+    write_u64(
+        &mut page,
+        JOURNAL_ORIGINAL_FILE_LEN_OFFSET,
+        header.original_file_len,
+    );
+    write_u16(
+        &mut page,
+        JOURNAL_DB_NAME_LEN_OFFSET,
+        db_name_bytes.len() as u16,
+    );
+
+    let name_start = JOURNAL_DB_NAME_OFFSET;
+    let name_end = name_start + db_name_bytes.len();
+
+    page[name_start..name_end].copy_from_slice(db_name_bytes);
+
+    file.seek(SeekFrom::Start(0)).map_err(|err| {
+        SqdbError::IoError(format!("Could not seek journal header: {}", err))
+    })?;
+
+    file.write_all(&page).map_err(|err| {
+        SqdbError::IoError(format!("Could not write journal header: {}", err))
+    })?;
+
+    Ok(())
+}
+
+fn read_journal_header_from_path(path: &Path) -> Result<JournalHeader, SqdbError> {
+    let mut file = File::open(path).map_err(|err| {
+        SqdbError::IoError(format!(
+            "Could not open journal file `{}`: {}",
+            path.display(),
+            err
+        ))
+    })?;
+
+    read_journal_header_from_file(&mut file)
+}
+
+fn read_journal_header_from_file(file: &mut File) -> Result<JournalHeader, SqdbError> {
+    let mut page = [0u8; PAGE_SIZE];
+
+    file.seek(SeekFrom::Start(0)).map_err(|err| {
+        SqdbError::IoError(format!("Could not seek journal header: {}", err))
+    })?;
+
+    file.read_exact(&mut page).map_err(|err| {
+        SqdbError::IoError(format!("Could not read journal header: {}", err))
+    })?;
+
+    if &page[JOURNAL_MAGIC_OFFSET..JOURNAL_MAGIC_OFFSET + 8] != JOURNAL_MAGIC {
+        return Err(SqdbError::IoError(
+            "Invalid journal file: magic number mismatch.".to_string(),
+        ));
+    }
+
+    let version = read_u32(&page, JOURNAL_VERSION_OFFSET);
+
+    if version != JOURNAL_VERSION {
+        return Err(SqdbError::IoError(format!(
+            "Unsupported journal version {}. Expected {}.",
+            version, JOURNAL_VERSION
+        )));
+    }
+
+    let page_size = read_u32(&page, JOURNAL_PAGE_SIZE_OFFSET);
+
+    if page_size != PAGE_SIZE as u32 {
+        return Err(SqdbError::IoError(format!(
+            "Invalid journal page size {}. Expected {}.",
+            page_size, PAGE_SIZE
+        )));
+    }
+
+    let entry_count = read_u64(&page, JOURNAL_ENTRY_COUNT_OFFSET);
+    let original_file_len = read_u64(&page, JOURNAL_ORIGINAL_FILE_LEN_OFFSET);
+    let db_name_len = read_u16(&page, JOURNAL_DB_NAME_LEN_OFFSET) as usize;
+
+    if db_name_len > JOURNAL_DB_NAME_MAX_BYTES {
+        return Err(SqdbError::IoError(format!(
+            "Invalid journal database name length {}.",
+            db_name_len
+        )));
+    }
+
+    let name_start = JOURNAL_DB_NAME_OFFSET;
+    let name_end = name_start + db_name_len;
+
+    let db_name = String::from_utf8(page[name_start..name_end].to_vec()).map_err(|err| {
+        SqdbError::IoError(format!("Invalid UTF-8 database name in journal: {}", err))
+    })?;
+
+    Ok(JournalHeader {
+        entry_count,
+        original_file_len,
+        db_name,
+    })
+}
+
+fn journal_contains_page(path: &Path, page_id: u64) -> Result<bool, SqdbError> {
+    let mut file = File::open(path).map_err(|err| {
+        SqdbError::IoError(format!(
+            "Could not open journal file `{}`: {}",
+            path.display(),
+            err
+        ))
+    })?;
+
+    let header = read_journal_header_from_file(&mut file)?;
+
+    for index in 0..header.entry_count {
+        let entry_offset = JOURNAL_HEADER_SIZE_U64 + index * JOURNAL_ENTRY_SIZE;
+
+        file.seek(SeekFrom::Start(entry_offset)).map_err(|err| {
+            SqdbError::IoError(format!(
+                "Could not seek journal entry {}: {}",
+                index, err
+            ))
+        })?;
+
+        let mut page_id_buffer = [0u8; 8];
+
+        file.read_exact(&mut page_id_buffer).map_err(|err| {
+            SqdbError::IoError(format!(
+                "Could not read journal entry {} page id: {}",
+                index, err
+            ))
+        })?;
+
+        let stored_page_id = u64::from_le_bytes(page_id_buffer);
+
+        if stored_page_id == page_id {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn append_journal_entry(
+    path: &Path,
+    page_id: u64,
+    page: &[u8; PAGE_SIZE],
+) -> Result<(), SqdbError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|err| {
+            SqdbError::IoError(format!(
+                "Could not open journal file `{}` for append: {}",
+                path.display(),
+                err
+            ))
+        })?;
+
+    let mut header = read_journal_header_from_file(&mut file)?;
+
+    let entry_offset = JOURNAL_HEADER_SIZE_U64 + header.entry_count * JOURNAL_ENTRY_SIZE;
+
+    file.seek(SeekFrom::Start(entry_offset)).map_err(|err| {
+        SqdbError::IoError(format!(
+            "Could not seek journal append offset {}: {}",
+            entry_offset, err
+        ))
+    })?;
+
+    file.write_all(&page_id.to_le_bytes()).map_err(|err| {
+        SqdbError::IoError(format!(
+            "Could not write journal page id {}: {}",
+            page_id, err
+        ))
+    })?;
+
+    file.write_all(page).map_err(|err| {
+        SqdbError::IoError(format!(
+            "Could not write old page {} to journal: {}",
+            page_id, err
+        ))
+    })?;
+
+    // Make sure entry bytes are durable before increasing entry count.
+    file.sync_all().map_err(|err| {
+        SqdbError::IoError(format!(
+            "Could not sync journal entry for page {}: {}",
+            page_id, err
+        ))
+    })?;
+
+    header.entry_count += 1;
+
+    write_journal_header_to_file(&mut file, &header)?;
+
+    file.sync_all().map_err(|err| {
+        SqdbError::IoError(format!(
+            "Could not sync updated journal header: {}",
+            err
+        ))
+    })?;
+
+    Ok(())
+}
+
+fn rollback_journal_file(
+    database_file: &mut File,
+    journal_path: &Path,
+    expected_database_name: &str,
+) -> Result<(), SqdbError> {
+    let mut journal_file = File::open(journal_path).map_err(|err| {
+        SqdbError::IoError(format!(
+            "Could not open journal `{}` for rollback: {}",
+            journal_path.display(),
+            err
+        ))
+    })?;
+
+    let header = read_journal_header_from_file(&mut journal_file)?;
+
+    if header.db_name != expected_database_name {
+        return Err(SqdbError::IoError(format!(
+            "Journal belongs to `{}`, but expected `{}`.",
+            header.db_name, expected_database_name
+        )));
+    }
+
+    for index in 0..header.entry_count {
+        let entry_offset = JOURNAL_HEADER_SIZE_U64 + index * JOURNAL_ENTRY_SIZE;
+
+        journal_file
+            .seek(SeekFrom::Start(entry_offset))
+            .map_err(|err| {
+                SqdbError::IoError(format!(
+                    "Could not seek journal rollback entry {}: {}",
+                    index, err
+                ))
+            })?;
+
+        let mut page_id_buffer = [0u8; 8];
+
+        journal_file.read_exact(&mut page_id_buffer).map_err(|err| {
+            SqdbError::IoError(format!(
+                "Could not read rollback page id at entry {}: {}",
+                index, err
+            ))
+        })?;
+
+        let page_id = u64::from_le_bytes(page_id_buffer);
+
+        let mut page = [0u8; PAGE_SIZE];
+
+        journal_file.read_exact(&mut page).map_err(|err| {
+            SqdbError::IoError(format!(
+                "Could not read old page {} from journal: {}",
+                page_id, err
+            ))
+        })?;
+
+        write_page_to_file(database_file, page_id, &page)?;
+    }
+
+    database_file.set_len(header.original_file_len).map_err(|err| {
+        SqdbError::IoError(format!(
+            "Could not truncate database file during rollback: {}",
+            err
+        ))
+    })?;
+
+    database_file.sync_all().map_err(|err| {
+        SqdbError::IoError(format!(
+            "Could not sync database file during rollback: {}",
+            err
+        ))
+    })?;
+
+    Ok(())
+}
+
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1660,35 +2187,37 @@ mod tests {
     }
 
     #[test]
-    fn binary_storage_persists_values_after_reopen() {
-        let dir = unique_test_dir();
-        fs::create_dir_all(&dir).unwrap();
+	fn binary_storage_persists_values_after_reopen() {
+		let dir = unique_test_dir();
+		fs::create_dir_all(&dir).unwrap();
 
-        let storage = BinaryPageStorage::with_base_dir(dir.clone());
-        let db_name = "binary_persistence";
+		let storage = BinaryPageStorage::with_base_dir(dir.clone());
+		let db_name = "binary_persistence";
 
-        storage.create_database(db_name).unwrap();
+		storage.create_database(db_name).unwrap();
 
-        {
-            let mut db = storage.open_database(db_name).unwrap();
+		{
+			let mut db = storage.open_database(db_name).unwrap();
 
-            db.create_table("numbers", TableType::Stack, DataType::Int)
-                .unwrap();
+			db.create_table("numbers", TableType::Stack, DataType::Int)
+				.unwrap();
 
-            db.insert_raw("numbers", "100").unwrap();
-            db.insert_raw("numbers", "200").unwrap();
-        }
+			db.insert_raw("numbers", "100").unwrap();
+			db.insert_raw("numbers", "200").unwrap();
 
-        {
-            let mut db = storage.open_database(db_name).unwrap();
+			db.commit_transaction().unwrap();
+		}
 
-            assert_eq!(db.read_value("numbers").unwrap(), "200");
-        }
+		{
+			let mut db = storage.open_database(db_name).unwrap();
 
-        storage.drop_database(db_name).unwrap();
+			assert_eq!(db.read_value("numbers").unwrap(), "200");
+		}
 
-        let _ = fs::remove_dir_all(dir);
-    }
+		storage.drop_database(db_name).unwrap();
+
+		let _ = fs::remove_dir_all(dir);
+	}
 
     #[test]
     fn binary_storage_supports_json_values() {

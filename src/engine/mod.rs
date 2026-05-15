@@ -1,6 +1,3 @@
-use std::fs;
-use std::path::PathBuf;
-
 use crate::error::SqdbError;
 use crate::language::ast::{Command, DataType, TableType};
 use crate::storage::binary::{BinaryDatabaseHandle, BinaryPageStorage};
@@ -180,22 +177,20 @@ impl Engine {
     }
 
     fn commit(&mut self) -> Result<String, SqdbError> {
-        self.get_db_mut()?;
+		let db = self.get_db_mut()?;
 
-        Ok(
-            "Commit acknowledged. Current binary backend writes each operation directly to disk. Full transaction journaling will be added next."
-                .to_string(),
-        )
-    }
+		db.commit_transaction()?;
+
+		Ok("Transaction committed.".to_string())
+	}
 
     fn rollback(&mut self) -> Result<String, SqdbError> {
-        self.get_db_mut()?;
+		let db = self.get_db_mut()?;
 
-        Err(SqdbError::RuntimeError(
-            "Rollback is not available yet for BinaryPageStorage. Disk-based page journal rollback will be added in the next step."
-                .to_string(),
-        ))
-    }
+		db.rollback_transaction()?;
+
+		Ok("Transaction rolled back.".to_string())
+	}
 
     fn get_db_mut(&mut self) -> Result<&mut BinaryDatabaseHandle, SqdbError> {
         self.current_db.as_mut().ok_or_else(|| {
@@ -244,6 +239,8 @@ Other:
 
 #[cfg(test)]
 mod tests {
+	use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -310,33 +307,34 @@ mod tests {
     }
 
     #[test]
-    fn cli_engine_persists_binary_database_after_restart() {
-        let dir = unique_test_dir();
-        fs::create_dir_all(&dir).unwrap();
+	fn cli_engine_persists_binary_database_after_restart() {
+		let dir = unique_test_dir();
+		fs::create_dir_all(&dir).unwrap();
 
-        {
-            let storage = BinaryPageStorage::with_base_dir(dir.clone());
-            let mut engine = Engine::with_binary_storage(storage);
+		{
+			let storage = BinaryPageStorage::with_base_dir(dir.clone());
+			let mut engine = Engine::with_binary_storage(storage);
 
-            run(&mut engine, "create db test_persist;");
-            run(&mut engine, "create table numbers stack int;");
-            run(&mut engine, "insert numbers 100;");
-            run(&mut engine, "insert numbers 200;");
-        }
+			run(&mut engine, "create db test_persist;");
+			run(&mut engine, "create table numbers stack int;");
+			run(&mut engine, "insert numbers 100;");
+			run(&mut engine, "insert numbers 200;");
+			run(&mut engine, "commit;");
+		}
 
-        {
-            let storage = BinaryPageStorage::with_base_dir(dir.clone());
-            let mut engine = Engine::with_binary_storage(storage);
+		{
+			let storage = BinaryPageStorage::with_base_dir(dir.clone());
+			let mut engine = Engine::with_binary_storage(storage);
 
-            run(&mut engine, "create db test_persist;");
+			run(&mut engine, "create db test_persist;");
 
-            assert_eq!(run(&mut engine, "read numbers;"), "200");
+			assert_eq!(run(&mut engine, "read numbers;"), "200");
 
-            run(&mut engine, "drop db test_persist;");
-        }
+			run(&mut engine, "drop db test_persist;");
+		}
 
-        let _ = fs::remove_dir_all(dir);
-    }
+		let _ = fs::remove_dir_all(dir);
+	}
 
     #[test]
     fn cli_engine_supports_show_tables_type_and_dtype() {
